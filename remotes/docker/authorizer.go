@@ -26,7 +26,6 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/containerd/containerd/errdefs"
@@ -36,13 +35,15 @@ import (
 	"golang.org/x/net/context/ctxhttp"
 )
 
+var defaultExpiredIn = 60
+
 type dockerAuthorizer struct {
 	credentials func(string) (string, string, error)
 
 	client *http.Client
-	mu     sync.Mutex
 
-	auth map[string]string
+	tokenLocalCache     *tokenCache
+	challengeLocalCache *challengeCache
 }
 
 // NewAuthorizer creates a Docker authorizer using the provided function to
@@ -51,115 +52,166 @@ func NewAuthorizer(client *http.Client, f func(string) (string, string, error)) 
 	if client == nil {
 		client = http.DefaultClient
 	}
+
 	return &dockerAuthorizer{
 		credentials: f,
 		client:      client,
-		auth:        map[string]string{},
+
+		tokenLocalCache:     newTokenCache(),
+		challengeLocalCache: newChallengeCache(),
 	}
 }
 
+// Authorize handles auth request.
 func (a *dockerAuthorizer) Authorize(ctx context.Context, req *http.Request) error {
-	// TODO: Lookup matching challenge and scope rather than just host
-	if auth := a.getAuth(req.URL.Host); auth != "" {
-		req.Header.Set("Authorization", auth)
+	authID := authIDFromContext(ctx)
+
+	// skip auth if there is no challenge
+	//
+	// FIXME(fuweid):
+	// Basically, we don't know which kind of token will used for each
+	// request. All the requests will be rejected at the first time.
+	c, exist := a.challengeLocalCache.pop(authID)
+	if !exist {
+		return nil
 	}
 
+	host := req.URL.Host
+
+	var (
+		auth string
+		err  error
+	)
+
+	switch s := c.scheme; s {
+	case basicAuth:
+		auth, err = a.doBasicAuth(ctx, host, c)
+		if err != nil {
+			return err
+		}
+	case bearerAuth:
+		to, err := a.generateTokenOptions(ctx, host, c)
+		if err != nil {
+			return err
+		}
+
+		auth, err = a.doBearerAuth(ctx, to)
+		if err != nil {
+			return err
+		}
+	default:
+		return errors.Wrap(errdefs.ErrNotImplemented, "failed to find supported auth scheme")
+	}
+
+	req.Header.Set("Authorization", auth)
 	return nil
 }
 
 func (a *dockerAuthorizer) AddResponses(ctx context.Context, responses []*http.Response) error {
 	last := responses[len(responses)-1]
-	host := last.Request.URL.Host
+
+	// don't cache challenge if there is no auth ID.
+	authID := authIDFromContext(ctx)
 	for _, c := range parseAuthHeader(last.Header) {
 		if c.scheme == bearerAuth {
 			if err := invalidAuthorization(c, responses); err != nil {
-				// TODO: Clear token
-				a.setAuth(host, "")
 				return err
 			}
 
-			// TODO(dmcg): Store challenge, not token
-			// Move token fetching to authorize
-			return a.setTokenAuth(ctx, host, c.parameters)
+			if authID != "" {
+				a.challengeLocalCache.set(authID, c)
+			}
+			return nil
 		} else if c.scheme == basicAuth && a.credentials != nil {
-			// TODO: Resolve credentials on authorize
-			username, secret, err := a.credentials(host)
-			if err != nil {
-				return err
+			if authID != "" {
+				a.challengeLocalCache.set(authID, c)
 			}
-			if username != "" && secret != "" {
-				auth := username + ":" + secret
-				a.setAuth(host, fmt.Sprintf("Basic %s", base64.StdEncoding.EncodeToString([]byte(auth))))
-				return nil
-			}
+			return nil
 		}
 	}
-
 	return errors.Wrap(errdefs.ErrNotImplemented, "failed to find supported auth scheme")
 }
 
-func (a *dockerAuthorizer) getAuth(host string) string {
-	a.mu.Lock()
-	defer a.mu.Unlock()
+func (a *dockerAuthorizer) doBasicAuth(ctx context.Context, host string, c challenge) (string, error) {
+	var (
+		username, secret string
+		err              error
+	)
 
-	return a.auth[host]
+	if a.credentials != nil {
+		username, secret, err = a.credentials(host)
+		if err != nil {
+			return "", err
+		}
+	}
+
+	if username == "" || secret == "" {
+		return "", fmt.Errorf("failed to handle basic auth because missing username or secret")
+	}
+
+	auth := base64.StdEncoding.EncodeToString([]byte(username + ":" + secret))
+	return fmt.Sprintf("%s %s", c.scheme, auth), nil
 }
 
-func (a *dockerAuthorizer) setAuth(host string, auth string) bool {
-	a.mu.Lock()
-	defer a.mu.Unlock()
+func (a *dockerAuthorizer) doBearerAuth(ctx context.Context, to tokenOptions) (string, error) {
+	tidx := tokenOptionsToTokenIndex(to)
 
-	changed := a.auth[host] != auth
-	a.auth[host] = auth
+	// check cache
+	if value, exist := a.tokenLocalCache.lookup(tidx); exist {
+		return fmt.Sprintf("%s %s", "Bearer", value), nil
+	}
 
-	return changed
+	var (
+		t   token
+		err error
+	)
+
+	if to.secret != "" {
+		// credential information is provided, use oauth POST endpoint
+		t, err = a.fetchTokenWithOAuth(ctx, to)
+		if err != nil {
+			return "", errors.Wrap(err, "failed to fetch oauth token")
+		}
+	} else {
+		// do request anonymously
+		t, err = a.fetchToken(ctx, to)
+		if err != nil {
+			return "", errors.Wrap(err, "failed to fetch anonymous token")
+		}
+	}
+
+	a.tokenLocalCache.store(tidx, t)
+	return fmt.Sprintf("%s %s", "Bearer", t.value), nil
 }
 
-func (a *dockerAuthorizer) setTokenAuth(ctx context.Context, host string, params map[string]string) error {
-	realm, ok := params["realm"]
+func (a *dockerAuthorizer) generateTokenOptions(ctx context.Context, host string, c challenge) (tokenOptions, error) {
+	realm, ok := c.parameters["realm"]
 	if !ok {
-		return errors.New("no realm specified for token auth challenge")
+		return tokenOptions{}, errors.New("no realm specified for token auth challenge")
 	}
 
 	realmURL, err := url.Parse(realm)
 	if err != nil {
-		return errors.Wrap(err, "invalid token auth challenge realm")
+		return tokenOptions{}, errors.Wrap(err, "invalid token auth challenge realm")
 	}
 
 	to := tokenOptions{
 		realm:   realmURL.String(),
-		service: params["service"],
+		service: c.parameters["service"],
 	}
 
-	to.scopes = getTokenScopes(ctx, params)
+	to.scopes = getTokenScopes(ctx, c.parameters)
 	if len(to.scopes) == 0 {
-		return errors.Errorf("no scope specified for token auth challenge")
+		return tokenOptions{}, errors.Errorf("no scope specified for token auth challenge")
 	}
 
 	if a.credentials != nil {
 		to.username, to.secret, err = a.credentials(host)
 		if err != nil {
-			return err
+			return tokenOptions{}, err
 		}
 	}
-
-	var token string
-	if to.secret != "" {
-		// Credential information is provided, use oauth POST endpoint
-		token, err = a.fetchTokenWithOAuth(ctx, to)
-		if err != nil {
-			return errors.Wrap(err, "failed to fetch oauth token")
-		}
-	} else {
-		// Do request anonymously
-		token, err = a.fetchToken(ctx, to)
-		if err != nil {
-			return errors.Wrap(err, "failed to fetch anonymous token")
-		}
-	}
-	a.setAuth(host, fmt.Sprintf("Bearer %s", token))
-
-	return nil
+	return to, nil
 }
 
 type tokenOptions struct {
@@ -178,7 +230,7 @@ type postTokenResponse struct {
 	Scope        string    `json:"scope"`
 }
 
-func (a *dockerAuthorizer) fetchTokenWithOAuth(ctx context.Context, to tokenOptions) (string, error) {
+func (a *dockerAuthorizer) fetchTokenWithOAuth(ctx context.Context, to tokenOptions) (token, error) {
 	form := url.Values{}
 	form.Set("scope", strings.Join(to.scopes, " "))
 	form.Set("service", to.service)
@@ -194,13 +246,14 @@ func (a *dockerAuthorizer) fetchTokenWithOAuth(ctx context.Context, to tokenOpti
 		form.Set("password", to.secret)
 	}
 
+	issuedAt := time.Now()
 	resp, err := ctxhttp.Post(
 		ctx, a.client, to.realm,
 		"application/x-www-form-urlencoded; charset=utf-8",
 		strings.NewReader(form.Encode()),
 	)
 	if err != nil {
-		return "", err
+		return token{}, err
 	}
 	defer resp.Body.Close()
 
@@ -216,17 +269,28 @@ func (a *dockerAuthorizer) fetchTokenWithOAuth(ctx context.Context, to tokenOpti
 			"body":   string(b),
 		}).Debugf("token request failed")
 		// TODO: handle error body and write debug output
-		return "", errors.Errorf("unexpected status: %s", resp.Status)
+		return token{}, errors.Errorf("unexpected status: %s", resp.Status)
 	}
 
 	decoder := json.NewDecoder(resp.Body)
 
 	var tr postTokenResponse
 	if err = decoder.Decode(&tr); err != nil {
-		return "", fmt.Errorf("unable to decode token response: %s", err)
+		return token{}, fmt.Errorf("unable to decode token response: %s", err)
 	}
 
-	return tr.AccessToken, nil
+	if tr.IssuedAt.IsZero() {
+		tr.IssuedAt = issuedAt
+	}
+
+	if tr.ExpiresIn == 0 {
+		tr.ExpiresIn = defaultExpiredIn
+	}
+
+	return token{
+		value:     tr.AccessToken,
+		expiredAt: tr.IssuedAt.Add(time.Duration(tr.ExpiresIn) * time.Second),
+	}, nil
 }
 
 type getTokenResponse struct {
@@ -237,11 +301,11 @@ type getTokenResponse struct {
 	RefreshToken string    `json:"refresh_token"`
 }
 
-// getToken fetches a token using a GET request
-func (a *dockerAuthorizer) fetchToken(ctx context.Context, to tokenOptions) (string, error) {
+// fetchToken fetches a token using a GET request
+func (a *dockerAuthorizer) fetchToken(ctx context.Context, to tokenOptions) (token, error) {
 	req, err := http.NewRequest("GET", to.realm, nil)
 	if err != nil {
-		return "", err
+		return token{}, err
 	}
 
 	reqParams := req.URL.Query()
@@ -260,22 +324,23 @@ func (a *dockerAuthorizer) fetchToken(ctx context.Context, to tokenOptions) (str
 
 	req.URL.RawQuery = reqParams.Encode()
 
+	issuedAt := time.Now()
 	resp, err := ctxhttp.Do(ctx, a.client, req)
 	if err != nil {
-		return "", err
+		return token{}, err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 400 {
 		// TODO: handle error body and write debug output
-		return "", errors.Errorf("unexpected status: %s", resp.Status)
+		return token{}, errors.Errorf("unexpected status: %s", resp.Status)
 	}
 
 	decoder := json.NewDecoder(resp.Body)
 
 	var tr getTokenResponse
 	if err = decoder.Decode(&tr); err != nil {
-		return "", fmt.Errorf("unable to decode token response: %s", err)
+		return token{}, fmt.Errorf("unable to decode token response: %s", err)
 	}
 
 	// `access_token` is equivalent to `token` and if both are specified
@@ -286,10 +351,21 @@ func (a *dockerAuthorizer) fetchToken(ctx context.Context, to tokenOptions) (str
 	}
 
 	if tr.Token == "" {
-		return "", ErrNoToken
+		return token{}, ErrNoToken
 	}
 
-	return tr.Token, nil
+	if tr.IssuedAt.IsZero() {
+		tr.IssuedAt = issuedAt
+	}
+
+	if tr.ExpiresIn == 0 {
+		tr.ExpiresIn = defaultExpiredIn
+	}
+
+	return token{
+		value:     tr.Token,
+		expiredAt: tr.IssuedAt.Add(time.Duration(tr.ExpiresIn) * time.Second),
+	}, nil
 }
 
 func invalidAuthorization(c challenge, responses []*http.Response) error {
@@ -314,4 +390,14 @@ func sameRequest(r1, r2 *http.Request) bool {
 		return false
 	}
 	return true
+}
+
+func tokenOptionsToTokenIndex(to tokenOptions) tokenIndex {
+	return tokenIndex{
+		realm:    to.realm,
+		service:  to.service,
+		scopes:   strings.Join(to.scopes, " "),
+		username: to.username,
+		secret:   to.secret,
+	}
 }

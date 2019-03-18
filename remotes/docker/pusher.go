@@ -83,7 +83,7 @@ func (p dockerPusher) Push(ctx context.Context, desc ocispec.Descriptor) (conten
 	}
 
 	req.Header.Set("Accept", strings.Join([]string{desc.MediaType, `*`}, ", "))
-	resp, err := p.doRequestWithRetries(ctx, req, nil)
+	resp, err := p.doRequestWithRetries(ctx, req)
 	if err != nil {
 		if errors.Cause(err) != ErrInvalidAuthorization {
 			return nil, err
@@ -116,8 +116,6 @@ func (p dockerPusher) Push(ctx context.Context, desc ocispec.Descriptor) (conten
 		}
 	}
 
-	// TODO: Lookup related objects for cross repository push
-
 	if isManifest {
 		var putPath string
 		if p.tag != "" {
@@ -132,21 +130,31 @@ func (p dockerPusher) Push(ctx context.Context, desc ocispec.Descriptor) (conten
 		}
 		req.Header.Add("Content-Type", desc.MediaType)
 	} else {
-		// TODO: Do monolithic upload if size is small
-
 		// Start upload request
 		req, err = http.NewRequest(http.MethodPost, p.url("blobs", "uploads")+"/", nil)
 		if err != nil {
 			return nil, err
 		}
 
-		resp, err := p.doRequestWithRetries(ctx, req, nil)
+		if fromRepo := selectRepositoryMountCandidate(p.refspec, desc.Annotations); fromRepo != "" {
+			req = requestWithMountFrom(req, desc.Digest.String(), fromRepo)
+			ctx = contextWithAppendPullRepositoryScope(ctx, fromRepo)
+		}
+
+		resp, err := p.doRequestWithRetries(ctx, req)
 		if err != nil {
 			return nil, err
 		}
 
 		switch resp.StatusCode {
 		case http.StatusOK, http.StatusAccepted, http.StatusNoContent:
+		case http.StatusCreated:
+			p.tracker.SetStatus(ref, Status{
+				Status: content.Status{
+					Ref: ref,
+				},
+			})
+			return nil, errors.Wrapf(errdefs.ErrAlreadyExists, "content %v on remote", desc.Digest)
 		default:
 			// TODO: log error
 			return nil, errors.Errorf("unexpected response: %s", resp.Status)
@@ -319,4 +327,13 @@ func (pw *pushWriter) Truncate(size int64) error {
 	// TODO: if blob close request and start new request at offset
 	// TODO: always error on manifest
 	return errors.New("cannot truncate remote upload")
+}
+
+func requestWithMountFrom(req *http.Request, mount, from string) *http.Request {
+	q := req.URL.Query()
+
+	q.Set("mount", mount)
+	q.Set("from", from)
+	req.URL.RawQuery = q.Encode()
+	return req
 }

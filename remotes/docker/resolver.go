@@ -18,11 +18,15 @@ package docker
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/base64"
+	"fmt"
 	"net/http"
 	"net/url"
 	"path"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/containerd/containerd/errdefs"
 	"github.com/containerd/containerd/images"
@@ -205,7 +209,7 @@ func (r *dockerResolver) Resolve(ctx context.Context, ref string) (string, ocisp
 		req.Header = r.headers
 
 		log.G(ctx).Debug("resolving")
-		resp, err := fetcher.doRequestWithRetries(ctx, req, nil)
+		resp, err := fetcher.doRequestWithRetries(ctx, req)
 		if err != nil {
 			if errors.Cause(err) == ErrInvalidAuthorization {
 				err = errors.Wrapf(err, "pull access denied, repository does not exist or may require authorization")
@@ -378,23 +382,30 @@ func (r *dockerBase) doRequest(ctx context.Context, req *http.Request) (*http.Re
 	return resp, nil
 }
 
-func (r *dockerBase) doRequestWithRetries(ctx context.Context, req *http.Request, responses []*http.Response) (*http.Response, error) {
-	resp, err := r.doRequest(ctx, req)
-	if err != nil {
-		return nil, err
-	}
+func (r *dockerBase) doRequestWithRetries(ctx context.Context, req *http.Request) (*http.Response, error) {
+	ctx = contextWithAuthID(ctx, uniqueAuthID())
 
-	responses = append(responses, resp)
-	req, err = r.retryRequest(ctx, req, responses)
-	if err != nil {
-		resp.Body.Close()
-		return nil, err
+	responses := []*http.Response{}
+
+	for {
+		resp, err := r.doRequest(ctx, req)
+		if err != nil {
+			return nil, err
+		}
+
+		responses = append(responses, resp)
+		req, err = r.retryRequest(ctx, req, responses)
+		if err != nil {
+			resp.Body.Close()
+			return nil, err
+		}
+
+		if req != nil {
+			resp.Body.Close()
+			continue
+		}
+		return resp, err
 	}
-	if req != nil {
-		resp.Body.Close()
-		return r.doRequestWithRetries(ctx, req, responses)
-	}
-	return resp, err
 }
 
 func (r *dockerBase) retryRequest(ctx context.Context, req *http.Request, responses []*http.Response) (*http.Request, error) {
@@ -437,4 +448,30 @@ func copyRequest(req *http.Request) (*http.Request, error) {
 		}
 	}
 	return &ireq, nil
+}
+
+// authIDKey is used to store auth ID in context.
+type authIDKey struct{}
+
+// contextWithAuthID will generate random and unique auth ID and
+// store it with context.
+func contextWithAuthID(ctx context.Context, id string) context.Context {
+	return context.WithValue(ctx, authIDKey{}, id)
+}
+
+// authIDFromContext retrieves auth ID from context.
+func authIDFromContext(ctx context.Context) string {
+	id := ctx.Value(authIDKey{})
+	if id == nil {
+		return ""
+	}
+	return id.(string)
+}
+
+func uniqueAuthID() string {
+	t := time.Now()
+	var b [3]byte
+	// Ignore read failures, just decreases uniqueness
+	rand.Read(b[:])
+	return fmt.Sprintf("%d-%s", t.Nanosecond(), base64.URLEncoding.EncodeToString(b[:]))
 }

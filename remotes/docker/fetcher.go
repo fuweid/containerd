@@ -93,7 +93,7 @@ func (r dockerFetcher) open(ctx context.Context, u, mediatype string, offset int
 		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", offset))
 	}
 
-	resp, err := r.doRequestWithRetries(ctx, req, nil)
+	resp, err := r.doRequestWithRetries(ctx, req)
 	if err != nil {
 		return nil, err
 	}
