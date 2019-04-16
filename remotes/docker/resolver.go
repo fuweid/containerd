@@ -383,7 +383,9 @@ func (r *dockerBase) doRequest(ctx context.Context, req *http.Request) (*http.Re
 }
 
 func (r *dockerBase) doRequestWithRetries(ctx context.Context, req *http.Request) (*http.Response, error) {
-	ctx = contextWithAuthID(ctx, uniqueAuthID())
+	if authIDFromContext(ctx) == "" {
+		ctx = contextWithAuthID(ctx, uniqueAuthID())
+	}
 
 	responses := []*http.Response{}
 
@@ -441,8 +443,10 @@ func (r *dockerBase) retryRequest(ctx context.Context, req *http.Request, respon
 func copyRequest(req *http.Request) (*http.Request, error) {
 	ireq := *req
 	if ireq.GetBody != nil {
+		fmt.Println("--------------> get body")
 		var err error
 		ireq.Body, err = ireq.GetBody()
+		fmt.Println(ireq.Body)
 		if err != nil {
 			return nil, err
 		}

@@ -57,6 +57,7 @@ func (r dockerFetcher) Fetch(ctx context.Context, desc ocispec.Descriptor) (io.R
 		return nil, err
 	}
 
+	ctx = contextWithAuthID(ctx, uniqueAuthID())
 	return newHTTPReadSeeker(desc.Size, func(offset int64) (io.ReadCloser, error) {
 		for _, u := range urls {
 			rc, err := r.open(ctx, u, desc.MediaType, offset)

@@ -44,6 +44,8 @@ type dockerPusher struct {
 }
 
 func (p dockerPusher) Push(ctx context.Context, desc ocispec.Descriptor) (content.Writer, error) {
+	ctx = contextWithAuthID(ctx, uniqueAuthID())
+
 	ctx, err := contextWithRepositoryScope(ctx, p.refspec, true)
 	if err != nil {
 		return nil, err
@@ -130,6 +132,8 @@ func (p dockerPusher) Push(ctx context.Context, desc ocispec.Descriptor) (conten
 		}
 		req.Header.Add("Content-Type", desc.MediaType)
 	} else {
+		ctx = contextWithAuthID(ctx, uniqueAuthID())
+
 		// Start upload request
 		req, err = http.NewRequest(http.MethodPost, p.url("blobs", "uploads")+"/", nil)
 		if err != nil {

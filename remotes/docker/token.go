@@ -33,9 +33,11 @@ func (cc *challengeCache) pop(id string) (challenge, bool) {
 	defer cc.Unlock()
 
 	c, exist := cc.local[id]
-	if exist {
-		delete(cc.local, id)
-	}
+	/*
+		if exist {
+			delete(cc.local, id)
+		}
+	*/
 	return c, exist
 }
 
