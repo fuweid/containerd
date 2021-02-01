@@ -207,7 +207,8 @@ func (c *Client) fetch(ctx context.Context, rCtx *RemoteContext, ref string, lim
 		handler = rCtx.HandlerWrapper(handler)
 	}
 
-	if rCtx.MaxConcurrentDownloads > 0 {
+	limiter = rCtx.MaxConcurrentDownloadLimiter
+	if limiter == nil && rCtx.MaxConcurrentDownloads > 0 {
 		limiter = semaphore.NewWeighted(int64(rCtx.MaxConcurrentDownloads))
 	}
 

@@ -21,7 +21,6 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
-	"math/rand"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -475,23 +474,22 @@ func (s *store) Writer(ctx context.Context, opts ...content.WriterOpt) (content.
 	if wOpts.Ref == "" {
 		return nil, errors.Wrap(errdefs.ErrInvalidArgument, "ref must not be empty")
 	}
-	var lockErr error
-	for count := uint64(0); count < 10; count++ {
-		time.Sleep(time.Millisecond * time.Duration(rand.Intn(1<<count)))
-		if err := tryLock(wOpts.Ref); err != nil {
-			if !errdefs.IsUnavailable(err) {
-				return nil, err
-			}
 
-			lockErr = err
-		} else {
-			lockErr = nil
-			break
-		}
-	}
-
-	if lockErr != nil {
-		return nil, lockErr
+	// TODO(fuweid): The content local store is one of backends for metadata
+	// plugin. The metadata plugin is on the top of boltdb, which allows
+	// only one read-write transaction at a time.
+	//
+	// Writer is handled in one read-write transaction. If tryLock fails,
+	// there is one writer holding the lock. The writer cannot release the
+	// lock in other read-writer transaction because of boltdb limitation.
+	// Based on this case, we should not retry tryLock and just return
+	// error. The read-write transaction should be finished in the short
+	// time and let the caller handle the unavailable error.
+	//
+	// If we use the embedded key/value db supporting multiple read-write
+	// transactions at a time in the future, we can update this comment.
+	if err := tryLock(wOpts.Ref); err != nil {
+		return nil, err
 	}
 
 	w, err := s.writer(ctx, wOpts.Ref, wOpts.Desc.Size, wOpts.Desc.Digest)

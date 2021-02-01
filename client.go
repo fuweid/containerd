@@ -63,6 +63,7 @@ import (
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/pkg/errors"
+	"golang.org/x/sync/semaphore"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/backoff"
 	"google.golang.org/grpc/health/grpc_health_v1"
@@ -349,6 +350,13 @@ type RemoteContext struct {
 
 	// MaxConcurrentDownloads is the max concurrent content downloads for each pull.
 	MaxConcurrentDownloads int
+
+	// MaxConcurrentDownloadLimiter is another option for MaxConcurrentDownloads
+	// to limit the number of concurrent requests on pulling images. It can
+	// share the same limit between concurrent pulling image requests.
+	//
+	// It will override the MaxConcurrentDownloads option if it is not empty.
+	MaxConcurrentDownloadLimiter *semaphore.Weighted
 
 	// AllMetadata downloads all manifests and known-configuration files
 	AllMetadata bool

@@ -32,6 +32,7 @@ import (
 	cni "github.com/containerd/go-cni"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
+	"golang.org/x/sync/semaphore"
 	"google.golang.org/grpc"
 	runtime "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
 
@@ -101,6 +102,8 @@ type criService struct {
 	cniNetConfMonitor *cniNetConfSyncer
 	// baseOCISpecs contains cached OCI specs loaded via `Runtime.BaseRuntimeSpec`
 	baseOCISpecs map[string]*oci.Spec
+	// maxConcurrentDownloadLimiter limits concurrent request for blobs
+	maxConcurrentDownloadLimiter *semaphore.Weighted
 }
 
 // NewCRIService returns a new instance of CRIService
@@ -148,6 +151,10 @@ func NewCRIService(config criconfig.Config, client *containerd.Client) (CRIServi
 	c.baseOCISpecs, err = loadBaseOCISpecs(&config)
 	if err != nil {
 		return nil, err
+	}
+
+	if config.MaxConcurrentDownloads > 0 {
+		c.maxConcurrentDownloadLimiter = semaphore.NewWeighted(int64(config.MaxConcurrentDownloads))
 	}
 
 	return c, nil

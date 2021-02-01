@@ -20,9 +20,7 @@ import (
 	"context"
 	"io"
 	"io/ioutil"
-	"math/rand"
 	"sync"
-	"time"
 
 	"github.com/containerd/containerd/errdefs"
 	"github.com/opencontainers/go-digest"
@@ -30,11 +28,44 @@ import (
 	"github.com/pkg/errors"
 )
 
-var bufPool = sync.Pool{
-	New: func() interface{} {
-		buffer := make([]byte, 1<<20)
-		return &buffer
-	},
+var (
+	bufPool = sync.Pool{
+		New: func() interface{} {
+			buffer := make([]byte, 1<<20)
+			return &buffer
+		},
+	}
+
+	locks = &trylock{
+		locks: make(map[string]*keyWeighted),
+	}
+)
+
+type contentWriterWrapper struct {
+	Writer
+	ref string
+}
+
+func (w *contentWriterWrapper) Close() error {
+	defer func() {
+		if w.ref != "" {
+			locks.unlock(w.ref)
+			w.ref = ""
+		}
+	}()
+
+	return w.Writer.Close()
+}
+
+func (w *contentWriterWrapper) Commit(ctx context.Context, size int64, expected digest.Digest, opts ...Opt) error {
+	defer func() {
+		if w.ref != "" {
+			locks.unlock(w.ref)
+			w.ref = ""
+		}
+	}()
+
+	return w.Writer.Commit(ctx, size, expected, opts...)
 }
 
 // NewReader returns a io.Reader from a ReaderAt
@@ -91,37 +122,34 @@ func WriteBlob(ctx context.Context, cs Ingester, ref string, r io.Reader, desc o
 // is locked until the reference is available or returns an error.
 func OpenWriter(ctx context.Context, cs Ingester, opts ...WriterOpt) (Writer, error) {
 	var (
-		cw    Writer
-		err   error
-		retry = 16
+		cw  Writer
+		err error
 	)
-	for {
-		cw, err = cs.Writer(ctx, opts...)
-		if err != nil {
-			if !errdefs.IsUnavailable(err) {
-				return nil, err
-			}
 
-			// TODO: Check status to determine if the writer is active,
-			// continue waiting while active, otherwise return lock
-			// error or abort. Requires asserting for an ingest manager
-
-			select {
-			case <-time.After(time.Millisecond * time.Duration(rand.Intn(retry))):
-				if retry < 2048 {
-					retry = retry << 1
-				}
-				continue
-			case <-ctx.Done():
-				// Propagate lock error
-				return nil, err
-			}
-
-		}
-		break
+	wOpt := &WriterOpts{}
+	for _, o := range opts {
+		o(wOpt)
 	}
 
-	return cw, err
+	ref := wOpt.Ref
+	if ref == "" {
+		return nil, errors.Wrap(errdefs.ErrInvalidArgument, "ref must not be empty")
+	}
+
+	if err := locks.lock(ctx, ref); err != nil {
+		return nil, err
+	}
+
+	cw, err = cs.Writer(ctx, opts...)
+	if err != nil {
+		locks.unlock(ref)
+		return nil, err
+	}
+
+	return &contentWriterWrapper{
+		Writer: cw,
+		ref:    ref,
+	}, nil
 }
 
 // Copy copies data with the expected digest from the reader into the
