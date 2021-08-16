@@ -390,6 +390,7 @@ func (c *criService) loadSandbox(ctx context.Context, cntr containerd.Container)
 				notFound = true
 			}
 		}
+
 		if notFound {
 			// Task does not exist, set sandbox state as NOTREADY.
 			status.State = sandboxstore.StateNotReady
