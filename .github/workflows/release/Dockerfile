@@ -47,8 +47,12 @@ RUN \
 	--mount=type=cache,target=/root/.cache/go-build \
 	--mount=type=cache,target=/go/pkg \
 	export CC=$(xx-info)-gcc && xx-go --wrap && \
-	make release cri-release cri-cni-release && \
+	make build && \
 	for f in $(find bin -executable -type f); do xx-verify $f; done
+
+RUN \
+	export GIT_STATUS_OUTPUT=$(git status --porcelain) && \
+	test -z $GIT_STATUS_OUTPUT || (echo $GIT_STATUS_OUTPUT && exit 1)
 
 FROM scratch AS release
 COPY --from=target /go/src/github.com/containerd/containerd/releases/ /
