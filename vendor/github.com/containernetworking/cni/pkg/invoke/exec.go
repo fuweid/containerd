@@ -16,6 +16,7 @@ package invoke
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 
@@ -84,7 +85,29 @@ func ExecPluginWithResult(ctx context.Context, pluginPath string, netconf []byte
 		return nil, err
 	}
 
-	return create.CreateFromBytes(stdoutBytes)
+	// Plugin must return result in same version as specified in netconf
+	//
+	// From: v0.8.1 https://github.com/containernetworking/cni/blob/v0.8.1/pkg/invoke/exec.go#L86-L88
+	versionDecoder := &version.ConfigDecoder{}
+	confVersion, err := versionDecoder.Decode(netconf)
+	if err != nil {
+		return nil, err
+	}
+
+	// No matter what the version in the result, we always align it with
+	// the version of config
+	tmpResult := map[string]interface{}{}
+	if err := json.Unmarshal(stdoutBytes, &tmpResult); err != nil {
+		return nil, err
+	}
+	tmpResult["cniVersion"] = confVersion
+
+	stdoutBytes, err = json.Marshal(tmpResult)
+	if err != nil {
+		return nil, err
+	}
+
+	return create.Create(confVersion, stdoutBytes)
 }
 
 func ExecPluginWithoutResult(ctx context.Context, pluginPath string, netconf []byte, args CNIArgs, exec Exec) error {
