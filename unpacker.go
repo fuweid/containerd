@@ -127,15 +127,20 @@ func (u *unpacker) unpack(
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-EachLayer:
-	for i, desc := range layers {
+	doUnpackFn := func(i int, desc ocispec.Descriptor) error {
 		parent := identity.ChainID(chain)
 		chain = append(chain, diffIDs[i])
-
 		chainID := identity.ChainID(chain).String()
+
+		unlock, err := u.lockChainID(ctx, chainID)
+		if err != nil {
+			return err
+		}
+		defer unlock()
+
 		if _, err := sn.Stat(ctx, chainID); err == nil {
 			// no need to handle
-			continue
+			return nil
 		} else if !errdefs.IsNotFound(err) {
 			return fmt.Errorf("failed to stat snapshot %s: %w", chainID, err)
 		}
@@ -167,7 +172,7 @@ EachLayer:
 						log.G(ctx).WithField("key", key).WithField("chainid", chainID).Debug("extraction snapshot already exists, chain id not found")
 					} else {
 						// no need to handle, snapshot now found with chain id
-						continue EachLayer
+						return nil
 					}
 				} else {
 					return fmt.Errorf("failed to prepare extraction snapshot %q: %w", key, err)
@@ -227,7 +232,7 @@ EachLayer:
 		if err = sn.Commit(ctx, chainID, key, opts...); err != nil {
 			abort()
 			if errdefs.IsAlreadyExists(err) {
-				continue
+				return nil
 			}
 			return fmt.Errorf("failed to commit snapshot %s: %w", key, err)
 		}
@@ -243,7 +248,13 @@ EachLayer:
 		if _, err := cs.Update(ctx, cinfo, "labels.containerd.io/uncompressed"); err != nil {
 			return err
 		}
+		return nil
+	}
 
+	for i, desc := range layers {
+		if err := doUnpackFn(i, desc); err != nil {
+			return err
+		}
 	}
 
 	chainID := identity.ChainID(chain).String()
@@ -271,17 +282,22 @@ func (u *unpacker) fetch(ctx context.Context, h images.Handler, layers []ocispec
 		desc := desc
 		i := i
 
-		if u.limiter != nil {
-			if err := u.limiter.Acquire(ctx, 1); err != nil {
-				return err
-			}
+		if err := u.doAcquire(ctx); err != nil {
+			return err
 		}
 
 		eg.Go(func() error {
-			_, err := h.Handle(ctx2, desc)
-			if u.limiter != nil {
-				u.limiter.Release(1)
+			unlock, err := u.lockDescriptor(ctx2, desc)
+			if err != nil {
+				u.doRelease()
+				return err
 			}
+
+			_, err = h.Handle(ctx2, desc)
+
+			unlock()
+			u.doRelease()
+
 			if err != nil && !errors.Is(err, images.ErrSkipDesc) {
 				return err
 			}
@@ -306,7 +322,13 @@ func (u *unpacker) handlerWrapper(
 			layers = map[digest.Digest][]ocispec.Descriptor{}
 		)
 		return images.HandlerFunc(func(ctx context.Context, desc ocispec.Descriptor) ([]ocispec.Descriptor, error) {
+			unlock, err := u.lockDescriptor(ctx, desc)
+			if err != nil {
+				return nil, err
+			}
+
 			children, err := f.Handle(ctx, desc)
+			unlock()
 			if err != nil {
 				return children, err
 			}
@@ -347,6 +369,50 @@ func (u *unpacker) handlerWrapper(
 			return children, nil
 		})
 	}, eg
+}
+
+func (u *unpacker) doAcquire(ctx context.Context) error {
+	if u.limiter == nil {
+		return nil
+	}
+	return u.limiter.Acquire(ctx, 1)
+}
+
+func (u *unpacker) doRelease() {
+	if u.limiter == nil {
+		return
+	}
+	u.limiter.Release(1)
+}
+
+func (u *unpacker) lockChainID(ctx context.Context, chainID string) (func(), error) {
+	key := u.makeChainIDKeyWithSnapshotter(chainID)
+
+	if err := u.config.DuplicationSuppressor.Lock(ctx, key); err != nil {
+		return nil, err
+	}
+	return func() {
+		u.config.DuplicationSuppressor.Unlock(key)
+	}, nil
+}
+
+func (u *unpacker) lockDescriptor(ctx context.Context, desc ocispec.Descriptor) (func(), error) {
+	key := u.makeDescriptorKey(desc)
+
+	if err := u.config.DuplicationSuppressor.Lock(ctx, key); err != nil {
+		return nil, err
+	}
+	return func() {
+		u.config.DuplicationSuppressor.Unlock(key)
+	}, nil
+}
+
+func (u *unpacker) makeChainIDKeyWithSnapshotter(chainID string) string {
+	return fmt.Sprintf("sn://%s/%v", u.snapshotter, chainID)
+}
+
+func (u *unpacker) makeDescriptorKey(desc ocispec.Descriptor) string {
+	return fmt.Sprintf("blob://%v", desc.Digest)
 }
 
 func uniquePart() string {
