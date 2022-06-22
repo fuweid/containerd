@@ -67,6 +67,7 @@ var imageListFile = flag.String("image-list", "", "The TOML file containing the 
 func TestMain(m *testing.M) {
 	flag.Parse()
 	initImages(*imageListFile)
+	initForBenchmarkCRIImageList()
 	if err := ConnectDaemons(); err != nil {
 		logrus.WithError(err).Fatalf("Failed to connect daemons")
 	}

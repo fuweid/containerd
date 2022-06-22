@@ -190,6 +190,10 @@ func (c *criService) Register(s *grpc.Server) error {
 	return c.register(s)
 }
 
+func (c *criService) InstrumentedImageService() runtime.ImageServiceServer {
+	return newInstrumentedService(c)
+}
+
 // RegisterTCP register all required services onto a GRPC server on TCP.
 // This is used by containerd CRI plugin.
 func (c *criService) RegisterTCP(s *grpc.Server) error {
