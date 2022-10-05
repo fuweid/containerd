@@ -266,6 +266,7 @@ func TestRunPodSandboxWithShimStartAndTeardownCNISlow(t *testing.T) {
 
 	go func() {
 		defer wg.Done()
+
 		t.Log("Create a sandbox")
 		_, err := runtimeService.RunPodSandbox(sbConfig, failpointRuntimeHandler)
 		require.Error(t, err)
