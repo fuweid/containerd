@@ -31,6 +31,7 @@ import (
 	"time"
 
 	"github.com/containerd/containerd"
+	"github.com/containerd/containerd/containers"
 	cri "github.com/containerd/containerd/integration/cri-api/pkg/apis"
 	_ "github.com/containerd/containerd/integration/images" // Keep this around to parse `imageListFile` command line var
 	"github.com/containerd/containerd/integration/remote"
@@ -533,4 +534,8 @@ func EnsureImageExists(t *testing.T, imageName string) string {
 	require.NoError(t, err)
 
 	return imgID
+}
+
+func GetContainer(id string) (containers.Container, error) {
+	return containerdClient.ContainerService().Get(context.Background(), id)
 }

@@ -26,12 +26,18 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
+	runtimespec "github.com/opencontainers/runtime-spec/specs-go"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	criapiv1 "k8s.io/cri-api/pkg/apis/runtime/v1"
 
+	"github.com/containerd/containerd/pkg/cri/store/sandbox"
 	"github.com/containerd/containerd/pkg/failpoint"
+	"github.com/containerd/typeurl"
 )
 
 const (
@@ -227,6 +233,97 @@ func TestRunPodSandboxWithShimStartAndTeardownCNIFailure(t *testing.T) {
 	}
 	t.Run("CleanupAfterRestart", testCase(true))
 	t.Run("JustCleanup", testCase(false))
+}
+
+// TestRunPodSandboxWithShimStartAndTeardownCNISlow should keep the sandbox
+// record if failed to rollback CNI API.
+func TestRunPodSandboxWithShimStartAndTeardownCNISlow(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip()
+	}
+	if os.Getenv("ENABLE_CRI_SANDBOXES") != "" {
+		t.Skip()
+	}
+
+	t.Log("Init PodSandboxConfig with specific key")
+	labels := map[string]string{
+		t.Name(): "true",
+	}
+	sbConfig := PodSandboxConfig(t.Name(), "failpoint", WithPodLabels(labels))
+
+	t.Log("Inject CNI failpoint")
+	conf := &failpointConf{
+		// Delay 10s
+		Add: "1*delay(10000)",
+		// This is to make sure the sandbox container won't be deleted even if the defer functions are invoked in sandbox_run.go
+		// Without this, the test is flaky because ListPodSandbox may return empty list.
+		Del: "1*error(please retry)",
+	}
+	injectCNIFailpoint(t, sbConfig, conf)
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+
+	go func() {
+		defer wg.Done()
+		t.Log("Create a sandbox")
+		_, err := runtimeService.RunPodSandbox(sbConfig, failpointRuntimeHandler)
+		require.Error(t, err)
+		require.ErrorContains(t, err, "error reading from server: EOF")
+	}()
+
+	time.Sleep(5 * time.Second)
+	t.Log("Restart containerd after 5s")
+	RestartContainerd(t)
+
+	wg.Wait()
+
+	t.Log("ListPodSandbox with the specific label")
+	l, err := runtimeService.ListPodSandbox(&criapiv1.PodSandboxFilter{LabelSelector: labels})
+	require.NoError(t, err)
+	require.Len(t, l, 1)
+
+	sb := l[0]
+
+	defer func() {
+		t.Log("Cleanup leaky sandbox")
+		runtimeService.StopPodSandbox(sb.Id)
+		runtimeService.RemovePodSandbox(sb.Id)
+	}()
+
+	assert.Equal(t, sb.State, criapiv1.PodSandboxState_SANDBOX_NOTREADY)
+	assert.Equal(t, sb.Metadata.Name, sbConfig.Metadata.Name)
+	assert.Equal(t, sb.Metadata.Namespace, sbConfig.Metadata.Namespace)
+	assert.Equal(t, sb.Metadata.Uid, sbConfig.Metadata.Uid)
+	assert.Equal(t, sb.Metadata.Attempt, sbConfig.Metadata.Attempt)
+
+	t.Log("Get sandbox info")
+	_, info, err := SandboxInfo(sb.Id)
+	require.NoError(t, err)
+
+	// Note: info.NetNSClosed is not always false. It depends on if sandbox.NetNS.Remove() is called in sandbox_run.go.
+	// During containerd restart, that is underministic.
+
+	var netNS string
+	for _, n := range info.RuntimeSpec.Linux.Namespaces {
+		if n.Type == runtimespec.NetworkNamespace {
+			netNS = n.Path
+		}
+	}
+	assert.NotEmpty(t, netNS, "network namespace should be set")
+
+	t.Log("Get sandbox container")
+	c, err := GetContainer(sb.Id)
+	require.NoError(t, err)
+	any, ok := c.Extensions["io.cri-containerd.sandbox.metadata"]
+	require.True(t, ok, "sandbox metadata should exist in extension")
+	i, err := typeurl.UnmarshalAny(any)
+	require.NoError(t, err)
+	require.IsType(t, &sandbox.Metadata{}, i)
+	metadata, ok := i.(*sandbox.Metadata)
+	require.True(t, ok)
+	assert.NotEmpty(t, metadata.NetNSPath)
+	assert.Equal(t, netNS, metadata.NetNSPath, "network namespace path should be the same in runtime spec and sandbox metadata")
 }
 
 // failpointConf is used to describe cmdAdd/cmdDel/cmdCheck command's failpoint.
