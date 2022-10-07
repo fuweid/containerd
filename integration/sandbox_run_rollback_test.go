@@ -42,6 +42,7 @@ import (
 
 const (
 	failpointRuntimeHandler = "runc-fp"
+	failpointCNIBinary      = "cni-bridge-fp"
 
 	failpointShimPrefixKey = "io.containerd.runtime.v2.shim.failpoint."
 
@@ -246,18 +247,17 @@ func TestRunPodSandboxWithShimStartAndTeardownCNISlow(t *testing.T) {
 	}
 
 	t.Log("Init PodSandboxConfig with specific key")
+	sbName := t.Name()
+
 	labels := map[string]string{
-		t.Name(): "true",
+		sbName: "true",
 	}
-	sbConfig := PodSandboxConfig(t.Name(), "failpoint", WithPodLabels(labels))
+	sbConfig := PodSandboxConfig(sbName, "failpoint", WithPodLabels(labels))
 
 	t.Log("Inject CNI failpoint")
 	conf := &failpointConf{
-		// Delay 10s
-		Add: "1*delay(10000)",
-		// This is to make sure the sandbox container won't be deleted even if the defer functions are invoked in sandbox_run.go
-		// Without this, the test is flaky because ListPodSandbox may return empty list.
-		Del: "1*error(please retry)",
+		// Delay 1 day
+		Add: "1*delay(86400000)",
 	}
 	injectCNIFailpoint(t, sbConfig, conf)
 
@@ -273,8 +273,40 @@ func TestRunPodSandboxWithShimStartAndTeardownCNISlow(t *testing.T) {
 		require.ErrorContains(t, err, "error reading from server: EOF")
 	}()
 
-	time.Sleep(5 * time.Second)
-	t.Log("Restart containerd after 5s")
+	assert.NoError(t, Eventually(func() (bool, error) {
+		pids, err := PidsOf(failpointCNIBinary)
+		if err != nil || len(pids) == 0 {
+			return false, err
+		}
+
+		for _, pid := range pids {
+			envs, err := PidEnvs(pid)
+			if err != nil {
+				t.Logf("failed to read environ of pid %v: %v: skip it", pid, err)
+				continue
+			}
+
+			args, ok := envs["CNI_ARGS"]
+			if !ok {
+				t.Logf("expected CNI_ARGS env but got nothing, skip pid=%v", pid)
+				continue
+			}
+
+			for _, arg := range strings.Split(args, ";") {
+				kv := strings.SplitN(arg, "=", 2)
+				if len(kv) != 2 {
+					continue
+				}
+
+				if kv[0] == "K8S_POD_NAME" && kv[1] == sbName {
+					return true, nil
+				}
+			}
+		}
+		return false, nil
+	}, time.Second, 30*time.Second), "check that failpoint CNI.Add is running")
+
+	t.Log("Restart containerd")
 	RestartContainerd(t)
 
 	wg.Wait()
