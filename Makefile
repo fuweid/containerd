@@ -217,7 +217,7 @@ integration: ## run integration tests
 # TODO integrate cri integration bucket with coverage
 bin/cri-integration.test:
 	@echo "$(WHALE) $@"
-	@$(GO) test -c ./integration -o bin/cri-integration.test
+	@$(GO) test -c ./integration ${TESTFLAGS} -o bin/cri-integration.test
 
 cri-integration: binaries bin/cri-integration.test ## run cri integration tests (example: FOCUS=TestContainerListStats make cri-integration)
 	@echo "$(WHALE) $@"

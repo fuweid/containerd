@@ -571,10 +571,12 @@ type pullProgressReporter struct {
 
 func newPullProgressReporter(ref string, cancel context.CancelFunc, timeout time.Duration) *pullProgressReporter {
 	return &pullProgressReporter{
-		ref:         ref,
-		cancel:      cancel,
-		reqReporter: pullRequestReporter{},
-		timeout:     timeout,
+		ref:    ref,
+		cancel: cancel,
+		reqReporter: pullRequestReporter{
+			activeTickCh: make(chan struct{}, 0),
+		},
+		timeout: timeout,
 	}
 }
 
@@ -612,6 +614,8 @@ func (reporter *pullProgressReporter) start(ctx context.Context) {
 		var ticker = time.NewTicker(reportInterval)
 		defer ticker.Stop()
 
+		activeTickCh := reporter.reqReporter.activeTickCh
+
 		for {
 			select {
 			case <-ticker.C:
@@ -631,11 +635,23 @@ func (reporter *pullProgressReporter) start(ctx context.Context) {
 					continue
 				}
 
-				if time.Since(lastSeenTimestamp) > reporter.timeout {
-					log.G(ctx).Errorf("cancel pulling image %s because of no progress in %v", reporter.ref, reporter.timeout)
-					reporter.cancel()
-					return
+				if time.Since(lastSeenTimestamp) < reporter.timeout {
+					continue
 				}
+
+				select {
+				case <-activeTickCh:
+					continue
+				default:
+				}
+
+				log.G(ctx).Errorf("cancel pulling image %s because of no progress in %v", reporter.ref, reporter.timeout)
+				reporter.cancel()
+				return
+
+			case <-activeTickCh:
+				ticker.Reset(reportInterval)
+
 			case <-ctx.Done():
 				activeReqs, bytesRead := reporter.reqReporter.status()
 				log.G(ctx).Infof("stop pulling image %s: active requests=%v, bytes read=%v", reporter.ref, activeReqs, bytesRead)
@@ -678,10 +694,18 @@ type pullRequestReporter struct {
 	// totalBytesRead indicates that the total bytes has been read from
 	// remote registry.
 	totalBytesRead uint64
+	// activeTickCh is the ticker to reset pull progress timeout. Just in case
+	// that it is timeout as
+	activeTickCh chan struct{}
 }
 
 func (reporter *pullRequestReporter) incRequest() {
 	atomic.AddInt32(&reporter.activeReqs, 1)
+
+	select {
+	case reporter.activeTickCh <- struct{}{}:
+	default:
+	}
 }
 
 func (reporter *pullRequestReporter) decRequest() {
